@@ -1,643 +1,661 @@
 # ORIGINAL CREATOR: Luca Garofalo (Lucksi)
 # AUTHOR: Luca Garofalo (Lucksi)
-# Copyright (C) 2023-2024 Lucksi <lukege287@gmail.com>
+# Copyright (C) 2023-2025
 # License: GNU General Public License v3.0
 
-import requests
 import os
-from bs4 import BeautifulSoup as soup
+import re
+import sys
 import json
-from time import sleep
 import base64
 import hashlib
+import argparse
+from time import sleep
+from html import escape as html_escape
 
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup as soup
+
+
+# =========================
+# Config & Utilities
+# =========================
 
 class Utils:
     YELLOW = "\033[0;93m"
-    RED = "\033[31m"
-    GREEN = "\033[32m"
-    BLUE = "\033[94m"
-    WHITE = "\033[97m"
+    RED    = "\033[31m"
+    GREEN  = "\033[32m"
+    BLUE   = "\033[94m"
+    WHITE  = "\033[97m"
 
     @staticmethod
     def Clear_Screen():
         os.system("cls" if os.name == "nt" else "clear")
 
+    @staticmethod
+    def ensure_dir(path: str):
+        os.makedirs(path, exist_ok=True)
+
+
 class Engine:
+    # ---- Environment-driven config (container/Kasm friendly)
+    _socks_host = os.environ.get("TOR_SOCKS_HOST", "127.0.0.1")
+    _socks_port = os.environ.get("TOR_SOCKS_PORT", "9050")
+    _retries    = int(os.environ.get("REQ_RETRIES", "3"))
+    _timeout    = int(os.environ.get("REQ_TIMEOUT_SECS", "30"))
+
+    NON_INTERACTIVE = os.environ.get("NON_INTERACTIVE", "0") == "1"
+    AGREED          = os.environ.get("AGREEMENT_ACCEPTED", "0") == "1"
+    DEFAULT_ENCODE  = os.environ.get("ENCODE_REPORT", "0") == "1"
+    DEFAULT_IMAGES  = int(os.environ.get("INCLUDE_IMAGES", "2"))  # 1 yes, 2 no
+
     proxy = {
-        "http": "socks5h://127.0.0.1:9050",
-        "https": "socks5h://127.0.0.1:9050"
+        "http":  f"socks5h://{_socks_host}:{_socks_port}",
+        "https": f"socks5h://{_socks_host}:{_socks_port}",
     }
+
     headers = {
-        "Useragent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36",
+        # Fix: proper header key
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+        "Connection": "close",
     }
-    count = 1
 
-    @staticmethod
-    def encoding(report,name):
-        quest = int(input(Utils.BLUE + "\n[?]" + Utils.WHITE + "Do you want to encode the {} report(1)Yes(2)No?".format(name) + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "-->"))
-        if quest == 1:
-            EncodedFile = report.replace(".txt", ".Dk")
-            f = open(report, "r+")
-            reader = f.read()
-            f.close()
-            print(Utils.GREEN + "\n[+]" +
-                      Utils.WHITE + "Encoding report...")
-            sleep(3)
-            encodingString = reader.encode("utf-8")
-            Base64_Byte = base64.b64encode(encodingString)
-            FinalString = Base64_Byte.decode("utf-8")
-            f = open(EncodedFile, "w+", encoding="ascii")
-            f.write(FinalString)
-            f.close()
-            print(Utils.YELLOW + "[v]" + Utils.WHITE +
-                      "Report Encoded: {}".format(Utils.GREEN + EncodedFile.replace("output/","")))
-            os.remove(report)
-            print(Utils.GREEN + "\n[+]" + Utils.WHITE + "Report saved in: {}".format(
-                Utils.GREEN + EncodedFile))
-        else:
-            print(Utils.GREEN + "\n[+]" + Utils.WHITE + "Report saved in: {}".format(
-                Utils.GREEN + report))
-    @staticmethod
-    def HtmlReport(report,name):
-        content = """
-        <!--This Report has been created with Darkus
-Download link:https://github.com/Lucksi/Darkus-->
-        <html>
-            <head>
-                <meta name="viewport" content="width=device-width, initial-scale=0.9">
-                <title>Darkus Report</title>
-                <style>
-                    body{
-                        background-color: rgba(0, 0, 0, 0.836);
-                    }
+    # Robust session with retries/backoff
+    session = requests.Session()
+    adapter = HTTPAdapter(
+        max_retries=Retry(
+            total=_retries,
+            backoff_factor=1.0,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=False,  # retry any
+            raise_on_status=False,
+        )
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
 
-                    h1{
-                        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-                        color:red
-                    }
+    count = 1  # used in HTML report numbering
 
-                    p,h3,h4{
-                        color:white;
-                        font-family: 'Lucida Sans', 'Lucida Sans Regular', 'Lucida Grande', 'Lucida Sans Unicode', Geneva, Verdana, sans-serif;
 
-                    }
+# ---------- Small helpers for richer output
 
-                    p{
-                        font-size: 15px;
-                    }
+RE_EMAIL = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+RE_BTC   = re.compile(r"\b(bc1[0-9A-Za-z]{25,39}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b")
+RE_XMR   = re.compile(r"\b4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}\b")
+RE_PGP   = re.compile(r"-----BEGIN PGP PUBLIC KEY BLOCK-----")
 
-                    h3{
-                        font-size: 25px;
-                        font-weight: bold;
-                    }
+def extract_iocs(text: str | None):
+    text = text or ""
+    return {
+        "emails": list(set(RE_EMAIL.findall(text))),
+        "btc": list(set(RE_BTC.findall(text))),
+        "xmr": list(set(RE_XMR.findall(text))),
+        "pgp": bool(RE_PGP.search(text)),
+    }
 
-                    h4{
-                        font-size: 18px;
-                        font-weight: bold;
-                    }
+def write_json_line(path: str, obj: dict):
+    with open(path, "a", encoding="utf-8") as jf:
+        jf.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-                    .results{
-                        display: block;
-                        height: fit-content;
-                        width:fit-content;
-                        border: 3px solid white;
-                        border-radius: 20px;
-                        background-color: black;
-                    }
 
-                     .results p,h4{
-                        margin-left:10px;
-                        margin-top:-10px;
+# =========================
+# Core features
+# =========================
 
-                    }
-
-                    .results h4{
-                         margin-top:-5px;
-                    }
-
-                    a{
-                        text-decoration:none;
-                        color: #2779F6;
-                    }
-               </style>
-            </head>
-            <body>
-                <h3>Onion Links found</h3>
-                <h3>Report Generated with <a href = 'https://github.com/Lucksi/Darkus' target = 'blank'>Darkus</a></h4>
-                <div class = 'results'>"
-
-        """
-        htmlrep = report.replace(".txt",".html")
-        f = open(htmlrep,"w")
-        f.write(content)
-        f.close()
-        return htmlrep
-    
-    @staticmethod
-    def HashCheck(url):
-        report = "output/Banned.txt"
-        md5url = hashlib.md5(url.encode('utf-8')).hexdigest()
-        print(Utils.GREEN + "\n[+]" + Utils.WHITE + "Url Hashed: {}".format(Utils.GREEN + md5url + Utils.WHITE))
-        CheckUrl = "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/blacklist/banned/"
-        try:
-            req = requests.get(url = CheckUrl, proxies = Engine.proxy,headers=Engine.headers)
-            if md5url in req.text:
-                print(Utils.RED + "\n[!]" + Utils.WHITE + "Url: {} Have been Banned it may be a dangerous link".format(Utils.GREEN + url + Utils.WHITE))
-                f = open(report,"a")
-                f.write(url + "\r\n")
-            else:
-                print(Utils.YELLOW + "\n[v]" + Utils.WHITE + "Url: {} Have not been Banned".format(Utils.GREEN + url + Utils.WHITE))
-        except Exception as e:
-            CheckUrl = "https://ahmia.fi/blacklist/banned/"
-            try:
-                req = requests.get(url = CheckUrl, proxies = Engine.proxy,headers=Engine.headers)
-                if md5url in req.text:
-                    print(Utils.RED + "[!]" + Utils.WHITE + "Url: {} Have been Banned it may be a dangerous link".format(Utils.GREEN + url + Utils.WHITE))
-                    f = open(report,"a")
-                    f.write(url + "\r\n")
-                else:
-                    print(Utils.YELLOW + "[v]" + Utils.WHITE + "Url: {} Have not been Banned".format(Utils.GREEN + url + Utils.WHITE))
-            except Exception as e:
-                print(Utils.RED + "[!]" + Utils.WHITE + "Something went wrong...\n")
+class EngineOps:
 
     @staticmethod
     def Agreement():
         Utils.Clear_Screen()
-        print(Utils.BLUE + "[I]" + Utils.WHITE + "Checking Usage Agreement")
-        sleep(3)
-        if os.path.exists("Agreement.txt"):
-            sleep(3)
-            f = open("Agreement.txt", "r", newline=None)
-            content = f.read()
-            f.close()
-            if content != "Agreement Accepted":
-                sleep(4)
-                Utils.Clear_Screen()
-                f = open("Banner/Banner.txt", "r", newline=None)
-                for line in f:
-                    sleep(0.3)
-                    print(Utils.RED + line.replace("\n", ""))
-                f.close()
-                sleep(0.3)
-                try:
-                    choice = str(input(Utils.WHITE + "\nThis tool is intented only for research and educational purposes only. I do not assume any liability for any bad/illegal usage of this tool.\n\nPress" +
-                                       Utils.GREEN + "(Y)" + Utils.WHITE + "To accept" + Utils.RED + "(N)" + Utils.WHITE + "To decline\n\n" + Utils.RED + "[:DARKUS:]" + Utils.WHITE + "-->"))
-                    if choice == "Y" or choice == "y":
-                        f = open("Agreement.txt", "w")
-                        f.write("Agreement Accepted")
-                        f.close()
-                        Utils.Clear_Screen()
-                        print(Utils.YELLOW +
-                              "[v]" + Utils.WHITE + "Agreement Accepted")
-                        sleep(2)
-                    elif choice == "N" or choice == "n":
-                        print(
-                            Utils.RED + "Agreement refused You cannot use this tool if you do not accept this condition...\nExit")
-                        exit()
-                    else:
-                        Engine.Agreement()
-                except ValueError:
-                    Engine.Agreement()
-                except KeyboardInterrupt:
-                    print("\n")
-                    exit()
-            else:
-                print(Utils.YELLOW + "\n[v]" +
-                      Utils.WHITE + "Usage Agreement found")
-                sleep(2)
-        else:
-            Utils.Clear_Screen()
-            f = open("Banner/Banner.txt", "r", newline=None)
-            for line in f:
-                sleep(0.3)
-                print(Utils.RED + line.replace("\n", ""))
-            f.close()
-            sleep(0.3)
+        print(Utils.BLUE + "[I]" + Utils.WHITE + " Checking Usage Agreement")
+
+        # Non-interactive acceptance
+        if Engine.AGREED:
             try:
-                choice = str(input(Utils.WHITE + "\nThis tool is intented only for research and educational purposes only. I do not assume any liability for any bad/illegal usage of this tool.\n\nPress" +
-                                       Utils.GREEN + "(Y)" + Utils.WHITE + "To accept" + Utils.RED + "(N)" + Utils.WHITE + "To decline\n\n" + Utils.RED + "[:DARKUS:]" + Utils.WHITE + "-->"))
-                if choice == "Y" or choice == "y":
-                    f = open("Agreement.txt", "w")
+                with open("Agreement.txt", "w", encoding="utf-8") as f:
                     f.write("Agreement Accepted")
-                    f.close()
-                    Utils.Clear_Screen()
-                    print(Utils.YELLOW + "[v]" +
-                          Utils.WHITE + "Agreement Accepted")
-                    sleep(2)
-                elif choice == "N" or choice == "n":
-                    print(
-                        Utils.RED + "Agreement refused You cannot use this tool if you do not accept this condition...\nExit\n")
-                    exit()
-                else:
-                    Engine.Agreement()
-            except ValueError:
-                Engine.Agreement()
-            except KeyboardInterrupt:
-                print("\n")
-                exit()
+            except Exception:
+                pass
+
+        content = ""
+        if os.path.exists("Agreement.txt"):
+            try:
+                with open("Agreement.txt", "r", newline=None, encoding="utf-8") as f:
+                    content = f.read().strip()
+            except Exception:
+                content = ""
+
+        if content == "Agreement Accepted":
+            print(Utils.YELLOW + "[v]" + Utils.WHITE + " Usage Agreement found\n")
+            sleep(0.5)
+            return
+
+        # Show banner (if available)
+        Utils.Clear_Screen()
+        try:
+            with open("Banner/Banner.txt", "r", newline=None, encoding="utf-8") as f:
+                for line in f:
+                    print(Utils.RED + line.rstrip("\n"))
+                    sleep(0.03)
+        except Exception:
+            pass
+
+        if Engine.NON_INTERACTIVE:
+            # In headless mode without AGREEMENT_ACCEPTED, bail out safely
+            print(Utils.RED + "\n[!] Agreement not accepted and interactive mode is off. Exiting.\n")
+            sys.exit(1)
+
+        try:
+            choice = str(input(
+                Utils.WHITE + "\nThis tool is intended for research/education only. "
+                "I do not assume liability for misuse.\n\n"
+                "Press " + Utils.GREEN + "(Y)" + Utils.WHITE + " to accept or "
+                + Utils.RED + "(N)" + Utils.WHITE + " to decline.\n\n"
+                + Utils.RED + "[:DARKUS:]" + Utils.WHITE + "--> "
+            ))
+            if choice.lower() == "y":
+                with open("Agreement.txt", "w", encoding="utf-8") as f:
+                    f.write("Agreement Accepted")
+                Utils.Clear_Screen()
+                print(Utils.YELLOW + "[v]" + Utils.WHITE + " Agreement Accepted\n")
+                sleep(0.5)
+                return
+            else:
+                print(Utils.RED + "Agreement refused. Exiting.\n")
+                sys.exit(1)
+        except (ValueError, KeyboardInterrupt):
+            print("\n")
+            sys.exit(1)
 
     @staticmethod
     def Banner():
         Utils.Clear_Screen()
-        f = open("Banner/Banner.txt", "r", newline=None)
-        for line in f:
-            sleep(0.3)
-            print(Utils.RED + line.replace("\n", ""))
-        f.close()
-        sleep(0.3)
-        print(Utils.WHITE + "\nA Onion Websites Searcher\t  Coded by Lucksi")
-        print(Utils.RED + "____________________________________________________")
-        print(Utils.RED + "|" + Utils.WHITE + " Instagram:lucks_022" +
-              Utils.RED + "                              |")
-        print(Utils.RED + "|" + Utils.WHITE + " Email:lukege287@gmail.com" +
-              Utils.RED + "                        |")
-        print(Utils.RED + "|" + Utils.WHITE + " GitHub:Lucksi" +
-              Utils.RED + "                                    |")
-        print(Utils.RED + "|" + Utils.WHITE + " Twitter:@Lucksi_22" +
-              Utils.RED + "                               |")
-        print(Utils.RED + "|" + Utils.WHITE +
-              " Linkedin:https://www.linkedin.com/in/lucksi" + Utils.RED + "      |")
+        try:
+            with open("Banner/Banner.txt", "r", newline=None, encoding="utf-8") as f:
+                for line in f:
+                    print(Utils.RED + line.rstrip("\n"))
+                    sleep(0.02)
+        except Exception:
+            print(Utils.RED + "DARKUS / NUCLUS")
+        print(Utils.WHITE + "\nAn Onion Website Searcher\t  Coded by Lucksi / Nuclus hardened")
         print(Utils.RED + "----------------------------------------------------")
 
     @staticmethod
-    def dataExtraction(parser, name, report,out,htmlReport):
-        f2 = open(htmlReport,"a")
-        if name == "Ahmia":
-            f = open(report, "a")
-            f.write(name + " onion-links\r\n\n")
-            i = 0
-            list1 = parser.find_all("li", class_="result")
-            for link in list1:
-                title = link.find("h4").text.replace(" ", "").replace("\n", "")
-                url = link.find("a")["href"].split("redirect_url=")[-1].lstrip()
-                md5url = hashlib.md5(url.encode('utf-8')).hexdigest()
-                description = link.find("p").text.replace("\n", "")
-                try:
-                    timestamp = link.find("span", class_="lastSeen")[
-                        "data-timestamp"].replace("\n", "").replace("  ", "")
-                except Exception as e:
-                    timestamp = "None"
-                if out == 1:
-                    print(Utils.GREEN + "[+]" +
-                        Utils.WHITE + "Title: {}".format(Utils.GREEN + title))
-                    print(Utils.YELLOW + "[v]" +
-                        Utils.WHITE + "Url: {}".format(Utils.GREEN + url))
-                    print(Utils.YELLOW + "[v]" + Utils.WHITE +
-                        "Description: {}".format(Utils.GREEN + description))
-                    print(Utils.YELLOW + "[v]" + Utils.WHITE +
-                        "Timestamp: {}".format(Utils.GREEN + timestamp))
-                    print(Utils.YELLOW + "[v]" + Utils.WHITE +
-                        "MD5-url: {}\n".format(Utils.BLUE + md5url))
-                f.write("Title: {}\r\n".format(title))
-                f.write("Url: {}\r\n".format(url))
-                f.write("Description: {}\r\n".format(description))
-                f.write("Timestamp: {}\r\n".format(timestamp))
-                f.write("MD5-Url: {}\r\n\n".format(md5url))
+    def HashCheck(url: str):
+        """Check MD5(url) against banned lists."""
+        report = "output/Banned.txt"
+        Utils.ensure_dir(os.path.dirname(report))
+        md5url = hashlib.md5(url.encode('utf-8')).hexdigest()
+        print(Utils.GREEN + "\n[+]" + Utils.WHITE + f" Url Hashed: {Utils.GREEN}{md5url}{Utils.WHITE}")
 
-                f2.write("<h4>({})Title: {}</h4>".format(Engine.count,title))
-                f2.write("<p>Url: {}</p>".format("<a href ='" + url + "' target = 'blank'>" + url + "</a>"))
-                f2.write("<p>Description: {}</p>".format(description))
-                f2.write("<p>Timestamp: {}</p>".format(timestamp))
-                f2.write("<p>MD5-Url: <a>{}</a></p>".format(md5url))
-                Engine.count = Engine.count + 1
-                i = i + 1
-
-        elif name == "Torch":
-            f = open(report, "a")
-            f.write(name + "onion-links\r\n\n")
-            i = 0
-            list1 = parser.find_all("div", class_="result mb-3")
-            for link in list1:
-                title = link.find("h5").text.replace(
-                    "  ", "").replace("\n", "")
-                url = link.find("a")["href"]
-                description = link.find("p").text.replace("\n", "")
-                md5url = hashlib.md5(url.encode('utf-8')).hexdigest()
-                if out == 1:
-                    print(Utils.GREEN + "[+]" +
-                        Utils.WHITE + "Title: {}".format(Utils.GREEN + title))
-                    print(Utils.YELLOW + "[v]" +
-                        Utils.WHITE + "Url: {}".format(Utils.GREEN + url))
-                    print(Utils.YELLOW + "[v]" + Utils.WHITE +
-                        "Description: {}".format(Utils.GREEN + description))
-                    print(Utils.YELLOW + "[v]" + Utils.WHITE +
-                        "MD5-url: {}\n".format(Utils.BLUE + md5url))
-                f.write("Title: {}\r\n".format(title))
-                f.write("Url: {}\r\n".format(url))
-                f.write("Description: {}\r\n".format(description))
-                f.write("MD5-Url: {}\r\n\n".format(md5url))
-
-                f2.write("<h4>({})Title: {}</h4>".format(Engine.count,title))
-                f2.write("<p>Url: {}</p>".format("<a href ='" + url + "' target = 'blank'>" + url + "</a>"))
-                f2.write("<p>Description: {}</p>".format(description))
-                f2.write("<p>MD5-Url: <a>{}</a></p>".format(md5url))
-                Engine.count = Engine.count + 1
-                i = i+1
-
-        elif name == "Torch-Images":
-            report = report.replace(".txt","_image.txt")
-            f = open(report, "a")
-            f.write(name + " onion-links\r\n\n")
-            i = 0
-            list1 = parser.find_all("div", class_="imagehold")
-            for link in list1:
-                link2 = link.find_all("a")
-                for link3 in link2:
-                    title = link3.find("img")["alt"].replace(
-                        "  ", "").replace("\n", "")
-                    url = link3["href"]
-                    image = link3.find("img")["src"]
-                    md5url = hashlib.md5(url.encode('utf-8')).hexdigest()
-                    if out == 1:
-                        print(Utils.GREEN +
-                            "[+]" + Utils.WHITE + "Title: {}".format(Utils.GREEN + title))
-                        print(Utils.YELLOW + "[v]" +
-                            Utils.WHITE + "Url: {}".format(Utils.GREEN + url))
-                        print(Utils.YELLOW +
-                            "[v]" + Utils.WHITE + "Image-Url: {}".format(Utils.GREEN + image))
-                        print(Utils.YELLOW + "[v]" + Utils.WHITE +
-                        "MD5-url: {}\n".format(Utils.BLUE + md5url))
-                    f.write("Title: {}\r\n".format(title))
-                    f.write("Url: {}\r\n".format(url))
-                    f.write("Image-Url: {}\r\n".format(image))
-                    f.write("MD5-Url: {}\r\n\n".format(md5url))
-
-                    f2.write("<h4>({})Title: {}</h4>".format(Engine.count,title))
-                    f2.write("<p>Url: {}</p>".format("<a href ='" + url + "' target = 'blank'>" + url + "</a>"))
-                    f2.write("<p>Image-Url: {}</p>".format("<a href ='" + image + "' target = 'blank'>" + image + "</a>"))
-                    f2.write("<p>MD5-Url: <a>{}</a></p>".format(md5url))
-                    i = i+1
-                    Engine.count = Engine.count + 1
-            report = report.replace("_image.txt",".txt")
-
-        elif name == "notevil":
-            f = open(report, "a")
-            f.write(name + " onion-links\r\n\n")
-            i = 0
-            list1 = parser.find_all("div", class_="row")
-            for link in list1:
-                title = link.find_all("a")[2].text.replace(
-                    "  ", "").replace("\n", "")
-                url = link.find_all("a")[2]["href"]
-                description = link.find("span").text.replace("\n", "")
-                md5url = hashlib.md5(url.encode('utf-8')).hexdigest()
-                if out == 1:
-                    print(Utils.GREEN + "[+]" +
-                        Utils.WHITE + "Title: {}".format(Utils.GREEN + title))
-                    print(Utils.YELLOW + "[v]" +
-                        Utils.WHITE + "Url: {}".format(Utils.GREEN + url))
-                    print(Utils.YELLOW + "[v]" + Utils.WHITE +
-                        "Description: {}".format(Utils.GREEN + description))
-                    print(Utils.YELLOW + "[v]" + Utils.WHITE +
-                        "MD5-url: {}\n".format(Utils.BLUE + md5url))
-                f.write("Title: {}\r\n".format(title))
-                f.write("Url: {}\r\n".format(url))
-                f.write("Description: {}\r\n".format(description))
-                f.write("MD5-Url: {}\r\n\n".format(md5url))
-
-                f2.write("<h4>({})Title: {}</h4>".format(Engine.count,title))
-                f2.write("<p>Url: {}</p>".format("<a href ='" + url + "' target = 'blank'>" + url + "</a>"))
-                f2.write("<p>Description: {}</p>".format(description))
-                f2.write("<p>MD5-Url: <a>{}</a></p>".format(md5url))
-                Engine.count = Engine.count + 1
-                i = i+1
-        f.write("Total Onion {} Site Found: {}\r\n".format(name, str(i)))
-        f.close()
-        print(Utils.BLUE + "[I]" + Utils.WHITE + "Total {} Onion Site Found: {}".format(
-            Utils.GREEN + name + Utils.WHITE, Utils.GREEN + str(i) + Utils.WHITE))
-
-    @staticmethod
-    def Torch(parameter, report, out,htmlReport):
-        images = int(input(Utils.GREEN + "\n[+]" + Utils.WHITE +
-                     "Do you want to search images?(1)Yes(2)No" + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "-->"))
-        while images < 1 or images > 2:
-            images = int(input(Utils.GREEN + "\n[+]" + Utils.WHITE +
-                         "Do you want to search images?(1)Yes(2)No" + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "-->"))
-        if images == 1:
-            image_url = "http://torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd.onion/images?query={}".format(
-                parameter)
-        print(Utils.GREEN + "\n[+]" + Utils.WHITE +
-              "Searching Torch Results for : {}\n".format(Utils.GREEN + parameter))
-        url = "http://torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd.onion/search?query={}&action=search".format(
-            parameter)
-        try:
-            req = requests.get(url, proxies=Engine.proxy,
-                               headers=Engine.headers)
-            parser = soup(req.content, "html.parser")
-            Engine.dataExtraction(parser, "Torch", report, out,htmlReport)
-            if images == 1:
-                try:
-                    print(Utils.GREEN + "\n[+]" + Utils.WHITE +
-                          "Searching Torch Images Results for : {}\n".format(Utils.GREEN + parameter))
-                    req = requests.get(
-                        image_url, proxies=Engine.proxy, headers=Engine.headers)
-                    parser = soup(req.content, "html.parser")
-                    Engine.dataExtraction(parser, "Torch-Images", report, out,htmlReport)
-                except Exception as e:
-                    pass
-        except Exception as e:
-            pass
-
-    @staticmethod
-    def Notevil(parameter, report, out,htmlReport):
-        print(Utils.GREEN + "\n[+]" + Utils.WHITE +
-              "Searching notevil Results for : {}\n".format(Utils.GREEN + parameter))
-        url = "http://notevilmtxf25uw7tskqxj6njlpebyrmlrerfv5hc4tuq7c7hilbyiqd.onion/index.php?q={}".format(
-            parameter)
-        try:
-            req = requests.get(url, proxies=Engine.proxy,
-                               headers=Engine.headers)
-            parser = soup(req.content, "html.parser")
-            Engine.dataExtraction(parser, "notevil", report, out,htmlReport)
-        except Exception as e:
-            pass
-
-
-    @staticmethod
-    def Ahmia(parameter, report, out,htmlReport):
-        print(Utils.GREEN + "\n[+]" + Utils.WHITE +
-              "Input Parameter: {}".format(parameter))
-        period = int(input(Utils.GREEN + "\n[+]" + Utils.WHITE +
-                     "Insert a Period of time\n(1)Last-Day\t\t(2)Last-Week\n(3)Last-Month\t\t(4)All-Results" + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "-->"))
-        while period < 1 or period > 4:
-            period = int(input(Utils.GREEN + "\n[+]" + Utils.WHITE +
-                         "Insert a Period of time\n(1)Last-Day\t\t(2)Last-Week\n(3)Last-Month\t\t(4)All-Results" + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "-->"))
-        if period == 1:
-            url = "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q={}&d=1".format(
-                parameter)
-            resc_url = "https://ahmia.fi/search/?q={}&d=1".format(parameter)
-        elif period == 2:
-            url = "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q={}&d=7".format(
-                parameter)
-            resc_url = "https://ahmia.fi/search/?q={}&d=7".format(parameter)
-        elif period == 3:
-            url = "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q={}&d=30".format(
-                parameter)
-            resc_url = "https://ahmia.fi/search/?q={}&d=30".format(parameter)
-        elif period == 4:
-            url = "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q={}&d=all".format(
-                parameter)
-            resc_url = "https://ahmia.fi/search/?q={}&d=all".format(parameter)
-        print(Utils.GREEN + "\n[+]" + Utils.WHITE +
-              "Searching Ahmia Results for : {}\n".format(Utils.GREEN + parameter))
-        try:
-            req = requests.get(url, proxies=Engine.proxy,
-                               headers=Engine.headers)
-            parser = soup(req.content, "html.parser")
-            Engine.dataExtraction(parser, "Ahmia", report, out,htmlReport)
-        except Exception as e:
+        endpoints = [
+            "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/blacklist/banned/",
+            "https://ahmia.fi/blacklist/banned/",
+        ]
+        banned = False
+        for endpoint in endpoints:
             try:
-                print(resc_url)
-                req = requests.get(
-                    resc_url, proxies=Engine.proxy, headers=Engine.headers)
-                parser = soup(req.content, "html.parser")
-                Engine.dataExtraction(parser, "Ahmia", report, out,htmlReport)
-            except Exception as e:
-                pass
+                r = Engine.session.get(endpoint, proxies=Engine.proxy,
+                                       headers=Engine.headers, timeout=Engine._timeout)
+                if r.ok and md5url in r.text:
+                    banned = True
+                    break
+            except Exception:
+                continue
+
+        if banned:
+            print(Utils.RED + "[!]" + Utils.WHITE + f" Url appears on a banned list: {Utils.GREEN}{url}{Utils.WHITE}")
+            with open(report, "a", encoding="utf-8") as f:
+                f.write(url + "\r\n")
+        else:
+            print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Url not found on banned list: {Utils.GREEN}{url}{Utils.WHITE}")
 
     @staticmethod
-    def HelpMsg():
-        print(Utils.RED + "____________________________________________________________________")
-        print (Utils.RED + "|" + Utils.WHITE + " DB-A = Execute Local Database" + Utils.RED +"                                    |\n|" + Utils.WHITE + " DB-D = Deactivate Local Database" + Utils.RED + "                                 |\n|" + Utils.WHITE + " DB-S = Local Database Status" + Utils.RED + "                                     |\n|" + Utils.WHITE + " Darkus-Exit = Exit from the programm" + Utils.RED + "                             |\n|" + Utils.WHITE + "--Check = Check if the given url is included on Ahmia Blacklist" + Utils.RED + "   |")
-        print(Utils.RED + "--------------------------------------------------------------------")
-        Engine.Main("No-Res")
+    def HtmlReport_open(report_txt: str):
+        """Create/initialize an HTML report and return its path (kept open later)."""
+        content = """<!-- Report created with Darkus/Nuclus -->
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=0.9">
+  <title>Darkus Report</title>
+  <style>
+    body{ background:#000; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;}
+    h3{ font-size: 22px; font-weight: bold; margin: 10px 0;}
+    .results{ display:block; border: 2px solid #999; border-radius: 14px; background:#111; padding:12px; margin-bottom:12px;}
+    a{ color:#2779F6; text-decoration:none;}
+    .meta{ color:#bbb; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h3>Onion Links found</h3>
+  <div class='meta'>Report generated by <a href='https://github.com/Lucksi/Darkus' target='_blank' rel='noopener'>Darkus</a> (Nuclus-hardened)</div>
+  <div id='container'>
+"""
+        htmlrep = report_txt.replace(".txt", ".html")
+        with open(htmlrep, "w", encoding="utf-8") as f:
+            f.write(content)
+        return htmlrep
 
     @staticmethod
-    def Requirements():
-        Engine.Agreement()
-        Utils.Clear_Screen()
-        print(Utils.BLUE + "[I]" + Utils.WHITE +
-              "Checking if Tor Service is active...")
-        sleep(3)
-        try:
-            service = requests.get("http://localhost:9050")
-            print(Utils.GREEN + "\n[+]" +
-                  Utils.WHITE + "Tor Service is active restart")
-            os.system("sudo service tor restart")
-        except requests.ConnectionError:
-            print(Utils.RED + "\n[!]" + Utils.WHITE +
-                  "Tor Service is not active. Activating Tor Service...\n")
-            os.system("sudo service tor start")
-            print(Utils.GREEN + "\n[+]" +
-                  Utils.WHITE + "Tor Service activated\n")
+    def HtmlReport_append(html_report: str, idx: int, title: str, url: str, description: str, timestamp: str | None, md5url: str, image_url: str | None = None):
+        title_e = html_escape(title or "")
+        desc_e  = html_escape(description or "")
+        url_e   = html_escape(url or "")
+        img_e   = html_escape(image_url or "") if image_url else None
+        ts_e    = html_escape(timestamp or "") if timestamp else ""
 
+        with open(html_report, "a", encoding="utf-8") as f:
+            f.write("<div class='results'>\n")
+            f.write(f"<h3>({idx}) {title_e}</h3>\n")
+            f.write(f"<div>Url: <a href='{url_e}' target='_blank' rel='noopener'>{url_e}</a></div>\n")
+            if img_e:
+                f.write(f"<div>Image: <a href='{img_e}' target='_blank' rel='noopener'>{img_e}</a></div>\n")
+            if desc_e:
+                f.write(f"<div>Description: {desc_e}</div>\n")
+            if ts_e:
+                f.write(f"<div>Timestamp: {ts_e}</div>\n")
+            f.write(f"<div>MD5-Url: <code>{md5url}</code></div>\n")
+            f.write("</div>\n")
 
     @staticmethod
-    def Main(mode):
-        if mode == "Res":
-            print(Utils.BLUE + "[I]" + Utils.WHITE +
-                "Checking internet connection...")
-            sleep(3)
-        ipUrl = "http://ip-api.com/json"
-        try:
-            ipReq = requests.get(ipUrl, proxies=Engine.proxy, timeout=15)
-            if mode == "Res":
-                Engine.Banner()
-                reader = ipReq.text
-                converted = json.loads(reader)
-                ip = converted["query"]
-                country = converted["country"]
-                print(Utils.BLUE + "\n[I]" + Utils.WHITE +
-                    "Your Tor-Proxy ip address: {}".format(Utils.GREEN + ip))
-                print(Utils.BLUE + "\n[I]" + Utils.WHITE +
-                    "Your are currently located in: {}".format(Utils.GREEN + country))
-                print(Utils.BLUE + "\n[I]" + Utils.WHITE +
-                    "Darkus-Exit for quitting the program")
-            param = str(input(Utils.GREEN + "\n[+]" + Utils.WHITE +
-                        "Insert a Parameter to search(Help For see all the options)" + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "-->"))
-            while param == "":
-                param = str(input(
-                    Utils.GREEN + "\n[+]" + Utils.WHITE + "Insert a Parameter to search(Darkus-Exit for quitting the program)" + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "-->"))
-            if param != "Darkus-Exit":
-                if param == "Help" or param == "help":
-                    Engine.HelpMsg()
-                elif param == "DB-A":
-                    os.system("sudo php -S 127.0.0.1:5600  >/dev/null 2>&1 &")
-                    print(Utils.BLUE + "\n[I]" + Utils.WHITE + "Local Database started at http://127.0.0.1:5600")
-                    Engine.Main("No-Res")
-                elif param == "DB-D":
-                    os.system("sudo killall php >/dev/null 2>&1 &")
-                    print(Utils.BLUE + "\n[I]" + Utils.WHITE + "Local Database stopped")
-                    Engine.Main("No-Res")
-                elif param == "DB-S":
-                    try:
-                        service = requests.get("http://localhost:5600")
-                        print(Utils.GREEN + "\n[+]" +
-                            Utils.WHITE + "Local Database Active at http://127.0.0.1:5600 ")
-                    except requests.ConnectionError:
-                        print(Utils.RED + "\n[!]" + Utils.WHITE +
-                            "Local Database is not not Active")
-                    Engine.Main("No-Res")
-                else:
-                    if "--Check" in param:
-                        url = param.replace("--Check","").replace(" ","")
-                        if url ==  "" or ".onion" not in url:
-                            print(Utils.BLUE + "[I]" + Utils.WHITE + "Please Insert a valid onion url before '--check'")
-                        
-                        else:
-                            Engine.HashCheck(url)
-                    else:
-                        fold = "output/{}".format(param)
-                        if os.path.exists(fold):
-                            pass
-                        else:
-                            os.mkdir(fold)
-                        report = "output/{}/{}.txt".format(param,param)
-                        if os.path.exists(report):
-                            os.remove(report)
-                            if os.path.exists(report.replace(".txt","_image.txt")):
-                                os.remove(report.replace(".txt","_image.txt"))
-                        if os.path.exists("output/{}/{}.Dk".format(param,param)):
-                            os.remove("output/{}/{}.Dk".format(param,param))
-                            if os.path.exists(report.replace(".Dk","_image.Dk")):
-                                os.remove(report.replace(".Dk","_image.Dk"))
-                        if os.path.exists("output/{}/{}.html".format(param,param)):
-                            os.remove("output/{}/{}.html".format(param,param))
-                        htmlReport= Engine.HtmlReport(report,param)
+    def HtmlReport_close(html_report: str):
+        with open(html_report, "a", encoding="utf-8") as f:
+            f.write("\n</div>\n</body>\n</html>")
 
-                        out = int(input(Utils.GREEN + "\n[+]" + Utils.WHITE +
-                                        "Do you want to print the output on Screen?(1)Yes(2)No" + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "-->"))
-                        while out < 1 or out > 2:
-                                out = int(input(Utils.GREEN + "\n[+]" + Utils.WHITE +
-                                        "Do you want to print the output on Screen?(1)Yes(2)No" + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "-->"))
-                        Engine.Ahmia(param, report, out,htmlReport)
-                        Engine.Torch(param, report, out,htmlReport)
-                        Engine.Notevil(param, report, out,htmlReport)
-                        f = open(report, "a")
-                        f.write("Total Onion Site Found: {}\r\n\nReport created with Darkus:https://github.com/Lucksi/Darkus".format(str(Engine.count)))
-                        f.close()
-                        print(Utils.BLUE + "\n[I]" + Utils.WHITE + "Total Onion Site Found: {}".format(
-                                Utils.GREEN + str(Engine.count) + Utils.WHITE))
-                        report2 = report.replace(".txt","_image.txt")
-                        print(Utils.BLUE + "\n[I]" + Utils.WHITE + "Html Report Created at: {} ".format(Utils.GREEN + htmlReport + Utils.WHITE))
-                        f = open(htmlReport,"a")
-                        f.write("</div>\n</body>\n</html>")
-                        f.close()
-                        Engine.encoding(report,"Web")
-                        if os.path.isfile(report2):
-                            Engine.encoding(report2,"Image")
-                        Engine.count = 0
-                    cont = input(Utils.WHITE + "\nPress enter to continue...")
-                    Utils.Clear_Screen()
-                    Engine.Main("Res")
-
+    @staticmethod
+    def maybe_encode_report(report_txt: str, name: str, force_encode: bool | None = None):
+        """Optionally base64-encode the TXT report into .Dk and remove original."""
+        if force_encode is None:
+            if Engine.NON_INTERACTIVE:
+                do_encode = Engine.DEFAULT_ENCODE
             else:
-                print(Utils.BLUE + "\n[I]" +
-                    Utils.WHITE + "Stopping Tor Service...")
-                os.system("sudo service tor stop")
-                sleep(2)
-                print(Utils.WHITE + "\nExit Thank you for having used Darkus...")
-        except requests.ConnectionError as e:
-            print(Utils.RED + "\n\n[!]" + Utils.WHITE +
-                  "Cannot connect to Network,Check your internet connection" + str(e))
+                try:
+                    do_encode = int(input(
+                        Utils.BLUE + "\n[?]" + Utils.WHITE +
+                        f" Do you want to encode the {name} report? (1) Yes (2) No"
+                        + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "--> "
+                    )) == 1
+                except Exception:
+                    do_encode = False
+        else:
+            do_encode = force_encode
+
+        if not do_encode:
+            print(Utils.GREEN + "\n[+]" + Utils.WHITE + f" Report saved in: {Utils.GREEN}{report_txt}{Utils.WHITE}")
+            return
+
+        encoded_file = report_txt.replace(".txt", ".Dk")
+        with open(report_txt, "r", encoding="utf-8") as f:
+            reader = f.read()
+        print(Utils.GREEN + "\n[+]" + Utils.WHITE + " Encoding report...")
+        sleep(0.5)
+        encoded_bytes = base64.b64encode(reader.encode("utf-8"))
+        final_str = encoded_bytes.decode("utf-8")
+        with open(encoded_file, "w", encoding="ascii") as f:
+            f.write(final_str)
+        os.remove(report_txt)
+        print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Report Encoded: {Utils.GREEN}{os.path.basename(encoded_file)}{Utils.WHITE}")
+        print(Utils.GREEN + "\n[+]" + Utils.WHITE + f" Report saved in: {Utils.GREEN}{encoded_file}{Utils.WHITE}")
+
+    @staticmethod
+    def _fetch_html(url: str) -> soup | None:
+        try:
+            r = Engine.session.get(url, proxies=Engine.proxy, headers=Engine.headers, timeout=Engine._timeout)
+            if not r.ok:
+                return None
+            return soup(r.text, "lxml")
+        except Exception:
+            return None
+
+    # -------------------------
+    # Search Engines
+    # -------------------------
+
+    @staticmethod
+    def search_ahmia(parameter: str, report_txt: str, out_console: bool, html_report: str):
+        name = "Ahmia"
+        i = 0
+        json_report = report_txt.replace(".txt", ".ndjson")
+        with open(report_txt, "a", encoding="utf-8") as f:
+            f.write(name + " onion-links\r\n\n")
+
+        url = f"https://ahmia.fi/search/?q={requests.utils.quote(parameter)}"
+        print(Utils.GREEN + "\n[+]" + Utils.WHITE + f" Searching Ahmia for: {Utils.GREEN}{parameter}{Utils.WHITE}")
+        parser = EngineOps._fetch_html(url)
+        if not parser:
+            print(Utils.RED + "[!]" + Utils.WHITE + " Failed to fetch results from Ahmia")
+            return
+
+        results = parser.find_all("li", class_="result")
+        for link in results:
+            try:
+                title = (link.find("h4") or {}).get_text("", strip=True)
+                raw_href = link.find("a")["href"]
+                # Ahmia uses redirect_url=...; keep original
+                url_real = raw_href.split("redirect_url=")[-1].strip()
+                description = (link.find("p") or {}).get_text("\n", strip=True)
+                ts_tag = link.find("span", class_="lastSeen")
+                timestamp = ts_tag.get("data-timestamp", "").strip() if ts_tag else None
+                md5url = hashlib.md5(url_real.encode('utf-8')).hexdigest()
+
+                if out_console:
+                    print(Utils.GREEN + "[+]" + Utils.WHITE + f" Title: {Utils.GREEN}{title}{Utils.WHITE}")
+                    print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Url: {Utils.GREEN}{url_real}{Utils.WHITE}")
+                    print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Description: {Utils.GREEN}{description}{Utils.WHITE}")
+                    if timestamp:
+                        print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Timestamp: {Utils.GREEN}{timestamp}{Utils.WHITE}")
+                    print(Utils.YELLOW + "[v]" + Utils.WHITE + f" MD5-url: {Utils.BLUE}{md5url}{Utils.WHITE}\n")
+
+                with open(report_txt, "a", encoding="utf-8") as f:
+                    f.write(f"Title: {title}\r\nUrl: {url_real}\r\nDescription: {description}\r\n")
+                    f.write(f"Timestamp: {timestamp or 'None'}\r\nMD5-Url: {md5url}\r\n\n")
+
+                EngineOps.HtmlReport_append(html_report, Engine.count, title, url_real, description, timestamp, md5url)
+                Engine.count += 1
+                i += 1
+
+                # IOC enrichment
+                ioc = extract_iocs(description)
+                write_json_line(json_report, {
+                    "engine": name, "title": title, "url": url_real,
+                    "description": description, "timestamp": timestamp, "md5": md5url, "ioc": ioc
+                })
+
+                # Optional safety list check
+                EngineOps.HashCheck(url_real)
+            except Exception:
+                continue
+
+        with open(report_txt, "a", encoding="utf-8") as f:
+            f.write(f"Total Onion {name} Site Found: {i}\r\n")
+        print(Utils.BLUE + "[I]" + Utils.WHITE + f" Total {Utils.GREEN}{name}{Utils.WHITE} Onion Sites Found: {Utils.GREEN}{i}{Utils.WHITE}")
+
+    @staticmethod
+    def search_torch(parameter: str, report_txt: str, out_console: bool, html_report: str, include_images: int):
+        """
+        Torch classic search & optional image search.
+        """
+        name = "Torch"
+        i = 0
+        json_report = report_txt.replace(".txt", ".ndjson")
+        with open(report_txt, "a", encoding="utf-8") as f:
+            f.write(name + " onion-links\r\n\n")
+
+        # .onion from provided snippet (may rotate over time)
+        base = "http://torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd.onion"
+        url = f"{base}/search?query={requests.utils.quote(parameter)}&action=search"
+        print(Utils.GREEN + "\n[+]" + Utils.WHITE + f" Searching Torch for: {Utils.GREEN}{parameter}{Utils.WHITE}")
+
+        parser = EngineOps._fetch_html(url)
+        if parser:
+            blocks = parser.find_all("div", class_="result mb-3")
+            for link in blocks:
+                try:
+                    title = (link.find("h5") or {}).get_text("", strip=True)
+                    url_real = link.find("a")["href"]
+                    description = (link.find("p") or {}).get_text("\n", strip=True)
+                    md5url = hashlib.md5(url_real.encode('utf-8')).hexdigest()
+
+                    if out_console:
+                        print(Utils.GREEN + "[+]" + Utils.WHITE + f" Title: {Utils.GREEN}{title}{Utils.WHITE}")
+                        print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Url: {Utils.GREEN}{url_real}{Utils.WHITE}")
+                        print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Description: {Utils.GREEN}{description}{Utils.WHITE}")
+                        print(Utils.YELLOW + "[v]" + Utils.WHITE + f" MD5-url: {Utils.BLUE}{md5url}{Utils.WHITE}\n")
+
+                    with open(report_txt, "a", encoding="utf-8") as f:
+                        f.write(f"Title: {title}\r\nUrl: {url_real}\r\nDescription: {description}\r\n")
+                        f.write(f"MD5-Url: {md5url}\r\n\n")
+
+                    EngineOps.HtmlReport_append(html_report, Engine.count, title, url_real, description, None, md5url)
+                    Engine.count += 1
+                    i += 1
+
+                    ioc = extract_iocs(description)
+                    write_json_line(json_report, {
+                        "engine": name, "title": title, "url": url_real,
+                        "description": description, "timestamp": None, "md5": md5url, "ioc": ioc
+                    })
+
+                    EngineOps.HashCheck(url_real)
+                except Exception:
+                    continue
+
+        # Optional image search
+        if include_images == 1:
+            name_img = "Torch-Images"
+            with open(report_txt.replace(".txt", "_image.txt"), "a", encoding="utf-8") as f:
+                f.write(name_img + " onion-links\r\n\n")
+            img_url = f"{base}/images?query={requests.utils.quote(parameter)}"
+            print(Utils.GREEN + "\n[+]" + Utils.WHITE + f" Searching Torch Images for: {Utils.GREEN}{parameter}{Utils.WHITE}")
+            p2 = EngineOps._fetch_html(img_url)
+            if p2:
+                blocks = p2.find_all("div", class_="imagehold")
+                for b in blocks:
+                    anchors = b.find_all("a")
+                    for a in anchors:
+                        try:
+                            title = (a.find("img") or {})["alt"].strip()
+                            url_real = a["href"]
+                            image = (a.find("img") or {})["src"]
+                            md5url = hashlib.md5(url_real.encode('utf-8')).hexdigest()
+
+                            if out_console:
+                                print(Utils.GREEN + "[+]" + Utils.WHITE + f" Title: {Utils.GREEN}{title}{Utils.WHITE}")
+                                print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Url: {Utils.GREEN}{url_real}{Utils.WHITE}")
+                                print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Image-Url: {Utils.GREEN}{image}{Utils.WHITE}")
+                                print(Utils.YELLOW + "[v]" + Utils.WHITE + f" MD5-url: {Utils.BLUE}{md5url}{Utils.WHITE}\n")
+
+                            with open(report_txt.replace(".txt", "_image.txt"), "a", encoding="utf-8") as f:
+                                f.write(f"Title: {title}\r\nUrl: {url_real}\r\nImage-Url: {image}\r\n")
+                                f.write(f"MD5-Url: {md5url}\r\n\n")
+
+                            EngineOps.HtmlReport_append(html_report, Engine.count, title, url_real, "", None, md5url, image_url=image)
+                            Engine.count += 1
+
+                            ioc = extract_iocs(title)
+                            write_json_line(report_txt.replace(".txt", ".ndjson"), {
+                                "engine": name_img, "title": title, "url": url_real,
+                                "image": image, "timestamp": None, "md5": md5url, "ioc": ioc
+                            })
+
+                            EngineOps.HashCheck(url_real)
+                        except Exception:
+                            continue
+
+        with open(report_txt, "a", encoding="utf-8") as f:
+            f.write(f"Total Onion {name} Site Found: {i}\r\n")
+        print(Utils.BLUE + "[I]" + Utils.WHITE + f" Total {Utils.GREEN}{name}{Utils.WHITE} Onion Sites Found: {Utils.GREEN}{i}{Utils.WHITE}")
+
+    @staticmethod
+    def search_notevil(parameter: str, report_txt: str, out_console: bool, html_report: str):
+        """
+        NotEvil (endpoints rotate frequently). Use best-effort parsing.
+        """
+        name = "notevil"
+        i = 0
+        json_report = report_txt.replace(".txt", ".ndjson")
+        with open(report_txt, "a", encoding="utf-8") as f:
+            f.write(name + " onion-links\r\n\n")
+
+        # Known pattern (may be stale; still safe to attempt)
+        candidates = [
+            "http://hss3uro2hsxfogfq.onion/?q=",
+        ]
+        parser = None
+        for base in candidates:
+            url = f"{base}{requests.utils.quote(parameter)}"
+            print(Utils.GREEN + "\n[+]" + Utils.WHITE + f" Searching notevil for: {Utils.GREEN}{parameter}{Utils.WHITE}")
+            parser = EngineOps._fetch_html(url)
+            if parser:
+                break
+
+        if not parser:
+            print(Utils.RED + "[!]" + Utils.WHITE + " Failed to fetch results from notevil")
+            return
+
+        rows = parser.find_all("div", class_="row")
+        for link in rows:
+            try:
+                anchors = link.find_all("a")
+                if len(anchors) < 3:
+                    continue
+                title = anchors[2].get_text("", strip=True)
+                url_real = anchors[2]["href"]
+                descr_tag = link.find("span")
+                description = descr_tag.get_text("\n", strip=True) if descr_tag else ""
+                md5url = hashlib.md5(url_real.encode('utf-8')).hexdigest()
+
+                if out_console:
+                    print(Utils.GREEN + "[+]" + Utils.WHITE + f" Title: {Utils.GREEN}{title}{Utils.WHITE}")
+                    print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Url: {Utils.GREEN}{url_real}{Utils.WHITE}")
+                    print(Utils.YELLOW + "[v]" + Utils.WHITE + f" Description: {Utils.GREEN}{description}{Utils.WHITE}")
+                    print(Utils.YELLOW + "[v]" + Utils.WHITE + f" MD5-url: {Utils.BLUE}{md5url}{Utils.WHITE}\n")
+
+                with open(report_txt, "a", encoding="utf-8") as f:
+                    f.write(f"Title: {title}\r\nUrl: {url_real}\r\nDescription: {description}\r\n")
+                    f.write(f"MD5-Url: {md5url}\r\n\n")
+
+                EngineOps.HtmlReport_append(html_report, Engine.count, title, url_real, description, None, md5url)
+                Engine.count += 1
+                i += 1
+
+                ioc = extract_iocs(description)
+                write_json_line(json_report, {
+                    "engine": name, "title": title, "url": url_real,
+                    "description": description, "timestamp": None, "md5": md5url, "ioc": ioc
+                })
+
+                EngineOps.HashCheck(url_real)
+            except Exception:
+                continue
+
+        with open(report_txt, "a", encoding="utf-8") as f:
+            f.write(f"Total Onion {name} Site Found: {i}\r\n")
+        print(Utils.BLUE + "[I]" + Utils.WHITE + f" Total {Utils.GREEN}{name}{Utils.WHITE} Onion Sites Found: {Utils.GREEN}{i}{Utils.WHITE}")
+
+
+# =========================
+# CLI / Main
+# =========================
+
+def build_arg_parser():
+    p = argparse.ArgumentParser(
+        description="Darkus / Nuclus-hardened dark web OSINT searcher (Tor required).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    p.add_argument("engine", nargs="?", default=None,
+                   help="Search engine: ahmia | torch | notevil | all")
+    p.add_argument("query", nargs="?", default=None, help="Search query / keywords")
+    p.add_argument("--output-dir", default="output", help="Output directory")
+    p.add_argument("--no-html", action="store_true", help="Disable HTML report generation")
+    p.add_argument("--encode", action="store_true", help="Force encode final TXT report to .Dk")
+    p.add_argument("--images", type=int, choices=[1, 2], default=None,
+                   help="Torch image search: 1 Yes, 2 No")
+    p.add_argument("--no-console-results", action="store_true",
+                   help="Do not print each result to console")
+    return p
+
+
+def interactive_prompt() -> tuple[str, str, int, bool]:
+    """Prompt user for engine, query, images preference, and console output."""
+    print(Utils.WHITE + "\nChoose engine: " + Utils.GREEN + "[ahmia/torch/notevil/all]" + Utils.WHITE)
+    try:
+        engine = str(input(Utils.RED + "[:DARKUS:]" + Utils.WHITE + " engine --> ")).strip().lower()
+    except KeyboardInterrupt:
+        print("\n"); sys.exit(1)
+    if engine not in ("ahmia", "torch", "notevil", "all"):
+        engine = "all"
+
+    try:
+        query = str(input(Utils.RED + "[:DARKUS:]" + Utils.WHITE + " query  --> ")).strip()
+    except KeyboardInterrupt:
+        print("\n"); sys.exit(1)
+    if not query:
+        print(Utils.RED + "[!] No query provided. Exiting.")
+        sys.exit(1)
+
+    if engine in ("torch", "all"):
+        if Engine.NON_INTERACTIVE:
+            images = Engine.DEFAULT_IMAGES
+        else:
+            try:
+                images = int(input(Utils.GREEN + "\n[+]" + Utils.WHITE +
+                                   " Do you want to search images? (1) Yes (2) No"
+                                   + Utils.RED + "\n\n[:DARKUS:]" + Utils.WHITE + "--> "))
+            except Exception:
+                images = 2
+            if images not in (1, 2):
+                images = 2
+    else:
+        images = 2
+
+    out_console = True
+    return engine, query, images, out_console
+
+
+def main():
+    # Accept alias: if someone types `db ...` we ignore the first token
+    argv = sys.argv
+    if len(argv) > 1 and argv[1].lower() == "db":
+        argv = [argv[0]] + argv[2:]
+
+    # EULA / Banner
+    EngineOps.Agreement()
+    EngineOps.Banner()
+
+    # Parse CLI
+    parser = build_arg_parser()
+    args = parser.parse_args(argv[1:])
+
+    if Engine.NON_INTERACTIVE and (args.engine is None or args.query is None):
+        print(Utils.RED + "[!] NON_INTERACTIVE is set but engine/query missing. "
+              "Usage: python Main.py all \"keyword\"")
+        sys.exit(2)
+
+    if args.engine is None or args.query is None:
+        engine, query, images, out_console = interactive_prompt()
+    else:
+        engine = (args.engine or "all").lower()
+        query = args.query
+        images = args.images if args.images in (1, 2) else (Engine.DEFAULT_IMAGES if engine in ("torch", "all") else 2)
+        out_console = not args.no_console_results
+
+    # Prepare outputs
+    output_dir = args.output_dir
+    Utils.ensure_dir(output_dir)
+    base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", query.strip())[:80] or "report"
+    report_txt = os.path.join(output_dir, f"{base_name}.txt")
+
+    # Initialize HTML
+    html_report = None
+    if not args.no_html:
+        html_report = EngineOps.HtmlReport_open(report_txt)
+
+    # Run engines
+    if engine in ("ahmia", "all"):
+        EngineOps.search_ahmia(query, report_txt, out_console, html_report or report_txt.replace(".txt", ".html"))
+    if engine in ("torch", "all"):
+        EngineOps.search_torch(query, report_txt, out_console, html_report or report_txt.replace(".txt", ".html"), images)
+    if engine in ("notevil", "all"):
+        EngineOps.search_notevil(query, report_txt, out_console, html_report or report_txt.replace(".txt", ".html"))
+
+    # Close HTML
+    if html_report:
+        EngineOps.HtmlReport_close(html_report)
+
+    # Maybe encode final TXT
+    EngineOps.maybe_encode_report(report_txt, name="final", force_encode=True if args.encode else None)
+
+    print(Utils.GREEN + "\n[+]" + Utils.WHITE + f" Done. See: {Utils.GREEN}{report_txt}{Utils.WHITE} "
+          f"and sidecar {Utils.GREEN}{report_txt.replace('.txt', '.ndjson')}{Utils.WHITE}")
+    if html_report:
+        print(Utils.GREEN + "[+]" + Utils.WHITE + f" HTML: {Utils.GREEN}{html_report}{Utils.WHITE}")
 
 
 if __name__ == "__main__":
-    try:
-        Engine.Requirements()
-        Engine.Main("Res")
-    except KeyboardInterrupt:
-        print(Utils.RED + "\n\n[!]" + Utils.WHITE +
-              "You Have pressed CTRL C stopping Tor Services and Exit")
-        os.system("sudo service tor stop")
+    main()
