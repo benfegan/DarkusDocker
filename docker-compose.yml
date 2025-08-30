@@ -1,0 +1,33 @@
+services:
+  Darkus:
+    # Build the app image that bundles Tor + Python + your tool
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: Darkus
+    # Keep an interactive TTY so analysts can use the current prompts
+    stdin_open: true
+    tty: true
+    # Persist outputs/reports and keep your Banner assets external
+    volumes:
+      - ./output:/app/output
+      - ./Banner:/app/Banner:ro
+      - ./Agreement.txt:/app/Agreement.txt # optional: pre-accept EULA
+      # If you want to edit code live during testing:
+      # - ./Main.py:/app/Main.py
+    environment:
+      # Let Tor & the app agree on where SOCKS is
+      TOR_SOCKS_HOST: 127.0.0.1
+      TOR_SOCKS_PORT: "9050"
+      # Non-interactive acceptance (optional): set to "1" to skip the EULA prompt
+      AGREEMENT_ACCEPTED: "0"
+      # Request timeouts / retries
+      REQ_TIMEOUT_SECS: "30"
+      REQ_RETRIES: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9050 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    
