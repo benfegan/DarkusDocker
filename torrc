@@ -1,0 +1,5 @@
+# Minimal, ephemeral circuits; socks on 9050 inside the container
+SocksPort 0.0.0.0:9050
+Log notice stdout
+DataDirectory /var/lib/tor
+# Guard against DNS leaks; your code uses socks5h so hostnames resolve via Tor
